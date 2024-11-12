@@ -1,0 +1,454 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Automated Control Rollout in AWS Control Tower
+
+Parameters:
+  ControlListValues:
+    Description: List of Controls to be activated in ARN Format
+    Type: String
+
+Resources:
+  JSONtoArrayLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      FunctionName: control-rollout-convert-json-to-array
+      Description: Converts JSON Object to Array
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+
+          def lambda_handler(event, context):
+              value = event['Parameter']['Value']
+              if value.startswith("'") and value.endswith("'"):
+                value = value[1:-1]
+              
+              array_value = json.loads(value)
+              
+              return array_value
+      MemorySize: 128
+      Timeout: 900
+      Runtime: python3.12
+
+  ReadoutOUsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      FunctionName: control-rollout-readout-ous
+      Description: Reads out all OUs
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def list_ous_recursive(organizations_client, parent_id, ou_list):
+            
+              paginator = organizations_client.get_paginator('list_organizational_units_for_parent')
+              for page in paginator.paginate(ParentId=parent_id):
+                  for ou in page['OrganizationalUnits']:
+                      ou_list.append(ou['Arn'])
+                      list_ous_recursive(organizations_client, ou['Id'], ou_list)
+
+          def lambda_handler(event, context):
+            
+              organizations_client = boto3.client('organizations')
+              all_ou_arns = []
+
+
+              roots = organizations_client.list_roots()
+              for root in roots['Roots']:
+                  root_id = root['Id']
+                  list_ous_recursive(organizations_client, root_id, all_ou_arns)
+                  
+              print(all_ou_arns)
+              return all_ou_arns
+      MemorySize: 128
+      Timeout: 900
+      Runtime: python3.12
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: control-rollout-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+                Service:
+                  - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName : control-rollout-role-policy
+          PolicyDocument :
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                - organizations:ListRoots
+                - organizations:ListOrganizationalUnitsForParent
+                Resource: "*"
+
+  SSMParameterControlList:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: '/org/controltower/controllist'
+      Description: List of Controls which should be activated
+      Type: String
+      Value: !Ref ControlListValues
+
+
+  StateMachineRole:
+    Type: "AWS::IAM::Role"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F3
+            reason: "Allow Resource * for ControlTower API"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub "states.${AWS::Region}.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: State-Machine-Invoke-Lambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: 
+                  - !GetAtt JSONtoArrayLambda.Arn
+                  - !GetAtt ReadoutOUsLambda.Arn
+              - Effect: "Allow"
+                Action:
+                  - "ssm:GetParameter"
+                  - "controltower:TagResource"
+                  - "organizations:AttachPolicy"
+                  - "controltower:EnableControl"
+                  - "controltower:EnableBaseline"
+                  - "controltower:EnableGuardrail"
+                  - "organizations:DescribeOrganization"
+                  - "organizations:ListRoots"
+                  - "organizations:ListOrganizationalUnitsForParent"
+                  - "organizations:EnablePolicyType"
+                  - "organizations:AttachPolicy"
+                  - "organizations:CreatePolicy"
+                  - "organizations:UpdatePolicy"
+                  - "organizations:DescribePolicy"
+                  - "organizations:ListPolicies"
+                  - "organizations:ListPoliciesForTarget"
+                  - "organizations:ListTargetsForPolicy"
+                Resource: "*"
+
+  ControlTowerControlsRollout:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      StateMachineName: ControlTowerControlsRollout
+      RoleArn: !GetAtt 'StateMachineRole.Arn'
+      DefinitionString:
+        Fn::Sub: |
+          {
+            "Comment": "A description of my state machine",
+            "StartAt": "Wait30Minutes",
+            "States": {
+              "Wait30Minutes": {
+                "Type": "Wait",
+                "Seconds": 1800,
+                "Next": "Parallel"
+              },
+              "Parallel": {
+                "Type": "Parallel",
+                "Branches": [
+                  {
+                    "StartAt": "GetParameter",
+                    "States": {
+                      "GetParameter": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "Name": "/org/controltower/controllist"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:ssm:getParameter",
+                        "Next": "LambdaJSONToArray"
+                      },
+                      "LambdaJSONToArray": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "arn:aws:lambda:eu-central-1:${AWS::AccountId}:function:control-rollout-convert-json-to-array",
+                          "Payload.$": "$"
+                        },
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "Lambda.ServiceException",
+                              "Lambda.AWSLambdaException",
+                              "Lambda.SdkClientException",
+                              "Lambda.TooManyRequestsException"
+                            ],
+                            "IntervalSeconds": 1,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2
+                          }
+                        ],
+                        "End": true,
+                        "ResultSelector": {
+                          "controls.$": "$.Payload"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "StartAt": "LambdaReadOutOUs",
+                    "States": {
+                      "LambdaReadOutOUs": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::lambda:invoke",
+                        "Parameters": {
+                          "FunctionName": "arn:aws:lambda:eu-central-1:${AWS::AccountId}:function:control-rollout-readout-ous"
+                        },
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "Lambda.ServiceException",
+                              "Lambda.AWSLambdaException",
+                              "Lambda.SdkClientException",
+                              "Lambda.TooManyRequestsException"
+                            ],
+                            "IntervalSeconds": 1,
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3
+                          }
+                        ],
+                        "End": true,
+                        "ResultSelector": {
+                          "ous.$": "$.Payload"
+                        }
+                      }
+                    }
+                  }
+                ],
+                "Next": "Pass"
+              },
+              "Pass": {
+                "Type": "Pass",
+                "Next": "MapOverControls",
+                "Parameters": {
+                  "controls.$": "$.[0].controls",
+                  "ous.$": "$.[1].ous"
+                }
+              },
+              "MapOverControls": {
+                "Type": "Map",
+                "ItemsPath": "$.controls",
+                "ResultPath": "$.controlOUPairs",
+                "Parameters": {
+                  "control.$": "$$.Map.Item.Value",
+                  "ous.$": "$.ous"
+                },
+                "MaxConcurrency": 1,
+                "Iterator": {
+                  "StartAt": "MapOverOUs",
+                  "States": {
+                    "MapOverOUs": {
+                      "Type": "Map",
+                      "InputPath": "$",
+                      "ItemsPath": "$.ous",
+                      "ResultPath": "$.pairs",
+                      "Parameters": {
+                        "control.$": "$.control",
+                        "ou.$": "$$.Map.Item.Value"
+                      },
+                      "MaxConcurrency": 1,
+                      "Iterator": {
+                        "StartAt": "PairControlAndOU",
+                        "States": {
+                          "PairControlAndOU": {
+                            "Type": "Pass",
+                            "ResultPath": "$.controlOUPair",
+                            "Next": "EnableControl"
+                          },
+                          "EnableControl": {
+                            "Type": "Task",
+                            "Parameters": {
+                              "ControlIdentifier.$": "$.control",
+                              "TargetIdentifier.$": "$.ou"
+                            },
+                            "Resource": "arn:aws:states:::aws-sdk:controltower:enableControl",
+                            "Catch": [
+                              {
+                                "ErrorEquals": [
+                                  "ControlTower.ValidationException"
+                                ],
+                                "Next": "ControlAlreadyActivated"
+                              }
+                            ],
+                            "Next": "Wait"
+                          },
+                          "Wait": {
+                            "Type": "Wait",
+                            "Seconds": 5,
+                            "End": true
+                          },
+                          "ControlAlreadyActivated": {
+                            "Type": "Pass",
+                            "End": true
+                          }
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                },
+                "End": true
+              }
+            }
+          }
+
+  TriggerControlRolloutStepFunctionLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'lambda.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Policies:
+      - PolicyName: trigger-control-rollout-stepfunction-policy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: Allow
+            Action:
+            - states:StartExecution
+            Resource: !Ref ControlTowerControlsRollout
+      RoleName: trigger-control-rollout-stepfunction-role
+
+#Create Lambda Function in CloudFormation
+  TriggerControlRolloutStepFunction:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Handler: index.lambda_handler
+      FunctionName: trigger-control-rollout-stepfunction
+      Description: Triggers StepFunction for Control Rollout when new Control is added
+      Role: !GetAtt 'TriggerControlRolloutStepFunctionLambdaRole.Arn'
+      Code:
+        ZipFile: |
+          import boto3
+          import os 
+          import cfnresponse
+          from botocore.exceptions import ClientError
+          from datetime import datetime
+
+          STATE_MACHINE_ARN=os.environ['StepFunctionARN']
+
+          def lambda_handler(event, context):
+
+              client = boto3.client('stepfunctions')
+              execution_name = f"ExecutionName-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+              
+              try:
+                  response = client.start_execution(
+                      stateMachineArn=STATE_MACHINE_ARN,
+                      name=execution_name
+                  )
+
+                  responseData = {}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+
+              except ClientError as e:
+                  print(e)
+                  responseData = {}
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+      MemorySize: 128
+      Timeout: 900
+      Runtime: python3.12
+      Environment:
+        Variables:
+          StepFunctionARN: !Ref ControlTowerControlsRollout
+
+
+  #Create Custom Resource
+  LambdaTriggerResource:
+    Type: Custom::CustomResource
+    Properties:
+      ServiceToken: !GetAtt TriggerControlRolloutStepFunction.Arn
+      Version: '1.0'
+      ParameterValue: !Ref ControlListValues
+
+
+  EventBridgeRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Description: IAM Role to trigger Step Function
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /         
+      Policies:
+        - PolicyName: ControlTowerControlsrollout-EventBridgePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: "Allow"
+                Action: "states:StartExecution"
+                Resource: !GetAtt ControlTowerControlsRollout.Arn
+
+  
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+        Description: "This rule sends CreateOrganizationalUnit API Calls to the Eventbridge Rule"
+        Name: ControlTowerControlsRollout
+        EventPattern: {
+        "source": [ 
+          "aws.controltower"
+        ], 
+        "detail-type": [ 
+          "AWS API Call via CloudTrail" 
+        ], 
+        "detail": { 
+          "eventSource": [ 
+            "controltower.amazonaws.com" 
+          ], 
+          "eventName": [
+            "ManageOrganizationalUnit"
+          ] 
+        } 
+      } 
+        State: "ENABLED"
+        Targets: 
+          - Arn: !GetAtt ControlTowerControlsRollout.Arn
+            Id: "ControlTowerControlsRollout"
+            RoleArn: !GetAtt EventBridgeRole.Arn
